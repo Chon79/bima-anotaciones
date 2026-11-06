@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>BIMA — PoC Anotaciones en AR con DOM Overlay</title>
+    <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f3f4f6;
+        }
+
+        #contenedor {
+            max-width: 800px;
+            margin: auto;
+            background: white;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+        }
+
+        h2 {
+            margin-top: 0;
+        }
+
+        #nota-tecnica {
+            font-size: 13px;
+            color: #6b7280;
+            margin-bottom: 12px;
+        }
+
+        model-viewer {
+            position: relative;
+            /* ancla para los hijos del slot por defecto (overlay) */
+            width: 100%;
+            height: 520px;
+            background-color: #f9fafb;
+            border-radius: 8px;
+            --poster-color: transparent;
+        }
+
+        /* ===================================================================
+     Todo lo de aquí abajo vive como HIJO DIRECTO de <model-viewer>
+     SIN atributo slot="...". model-viewer renderiza ese contenido
+     ("default slot") como una capa superpuesta al canvas 3D/AR.
+     Cuando entras a AR (WebXR en Android), model-viewer se registra a
+     sí mismo como el "root" del DOM Overlay de la sesión XR, así que
+     esta misma capa sigue siendo visible e interactiva DENTRO de la
+     cámara de AR — no hace falta duplicar UI para web vs AR.
+     =================================================================== */
+
+        .barra-ar {
+            position: absolute;
+            top: max(12px, env(safe-area-inset-top));
+            left: 12px;
+            right: 12px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            z-index: 20;
+            pointer-events: none;
+            /* el contenedor no bloquea; los hijos sí */
+        }
+
+        .barra-ar>* {
+            pointer-events: auto;
+        }
+
+        .btn {
+            padding: 9px 16px;
+            font-weight: bold;
+            font-size: 13px;
+            border-radius: 6px;
+            cursor: pointer;
+            border: 1px solid #ccc;
+            background: white;
+            color: #111827;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+        }
+
+        .btn[hidden] {
+            display: none;
+        }
+
+        .btn-activo {
+            background: #2563eb;
+            color: white;
+            border-color: #1d4ed8;
+        }
+
+        .pill-instruccion {
+            font-size: 12px;
+            color: white;
+            background: rgba(17, 24, 39, 0.75);
+            padding: 6px 10px;
+            border-radius: 999px;
+        }
+
+        /* Capa transparente que intercepta el toque SOLO en modo anotar.
+     Es la pieza clave para que AR no "robe" el toque para reposicionar
+     el modelo: al estar dentro del DOM Overlay y llamar
+     preventDefault() en touchstart, ese toque nunca llega a la
+     XRSession como evento de selección/colocación nativo. */
+        .capa-captura {
+            position: absolute;
+            inset: 0;
+            z-index: 10;
+            touch-action: none;
+            pointer-events: none;
+            /* se activa solo cuando modoAnotacion = true */
+            cursor: default;
+        }
+
+        .capa-captura.activa {
+            pointer-events: auto;
+            cursor: crosshair;
+        }
+
+        .hotspot-pin {
+            background: #ef4444;
+            border-radius: 50%;
+            border: 2px solid white;
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.4);
+        }
+
+        .modal-overlay {
+            position: absolute;
+            inset: 0;
+            z-index: 30;
+            background: rgba(17, 24, 39, 0.55);
+            display: none;
+            align-items: flex-end;
+            justify-content: center;
+            padding: 16px;
+        }
+
+        .modal-overlay.visible {
+            display: flex;
+        }
+
+        .modal-tarjeta {
+            width: 100%;
+            max-width: 420px;
+            background: white;
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+        }
+
+        .modal-tarjeta h4 {
+            margin: 0 0 8px;
+            font-size: 14px;
+            color: #111827;
+        }
+
+        .modal-tarjeta p {
+            margin: 0 0 10px;
+            font-size: 13px;
+            color: #374151;
+            line-height: 1.4;
+        }
+
+        .modal-tarjeta input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 9px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            /* 16px como mínimo: con menos, Safari en iPhone hace zoom a la
+               página al enfocar el input y descuadra toda la vista. */
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+
+        .modal-acciones {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+        }
+
+        .modal-acciones .btn-primario {
+            background: #2563eb;
+            color: white;
+            border-color: #1d4ed8;
+        }
+
+        .modal-acciones .btn-secundario {
+            background: #f3f4f6;
+        }
+
+        .btn-peligro {
+            background: #dc2626;
+            color: white;
+            border-color: #b91c1c;
+        }
+
+        /* El botón Borrar va a la izquierda, separado de Cerrar */
+        .modal-acciones .btn-peligro {
+            margin-right: auto;
+        }
+
+        #listaAnotaciones li {
+            margin-bottom: 8px;
+        }
+
+        .btn-mini {
+            padding: 3px 8px;
+            font-size: 11px;
+            margin-left: 6px;
+            box-shadow: none;
+        }
+
+        #payloadJson {
+            font-size: 11px;
+            background: #f3f4f6;
+            padding: 8px;
+            border-radius: 6px;
+            overflow-x: auto;
+        }
+
+        #registro-notas {
+            margin-top: 15px;
+        }
+
+        /* ===================================================================
+     MODO CÁMARA (iPhone y cualquier navegador sin WebXR AR)
+     Safari en iOS no soporta WebXR, y Quick Look (el AR nativo de
+     Apple) es una app aparte donde no corre nuestro JavaScript, así que
+     ahí no se pueden crear hotspots. En su lugar: ponemos el video de la
+     cámara trasera a pantalla completa y el visor 3D transparente encima.
+     El modelo no queda "anclado" al piso como en AR real, pero se ve
+     sobre el entorno y toda la lógica de anotar funciona sin cambios.
+     =================================================================== */
+        #videoCamara {
+            display: none;
+        }
+
+        body.modo-camara {
+            overflow: hidden;
+        }
+
+        body.modo-camara #videoCamara {
+            display: block;
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            object-fit: cover;
+            background: #000;
+            z-index: 999;
+        }
+
+        body.modo-camara model-viewer {
+            position: fixed;
+            inset: 0;
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            border-radius: 0;
+            background-color: transparent;
+            z-index: 1000;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Video de la cámara trasera para el modo cámara (iPhone) -->
+    <video id="videoCamara" playsinline muted autoplay></video>
+
+    <div id="contenedor">
+        <h2>PoC: Anotaciones anatómicas en AR (WebXR DOM Overlay)</h2>
+        <p id="nota-tecnica">
+            El botón y la tarjeta de captura viven como hijos directos de
+            <code>&lt;model-viewer&gt;</code>, así que aparecen tanto en la
+            vista web normal como superpuestos dentro de la sesión AR.
+            En iPhone usa «Ver con cámara» para anotar sobre la cámara.
+        </p>
+
+        <model-viewer id="visor3d" src="https://modelviewer.dev/shared-assets/models/Astronaut.glb"
+            ios-src="https://modelviewer.dev/shared-assets/models/Astronaut.usdz" alt="Modelo anatómico de prueba"
+            data-modelo-id="astronauta-demo" data-modelo-version="1" ar
+            ar-modes="webxr scene-viewer quick-look" camera-controls shadow-intensity="1">
+
+            <!-- Barra de control: visible en web y, gracias al DOM Overlay, también dentro de AR -->
+            <div class="barra-ar">
+                <button id="btnAnotar" class="btn">Modo: Explorar</button>
+                <button id="btnCamara" class="btn" hidden>Ver con cámara</button>
+                <button id="btnReposicionar" class="btn" hidden>Reposicionar</button>
+                <span id="pillInstruccion" class="pill-instruccion" hidden></span>
+            </div>
+
+            <!-- Capa transparente que captura el toque cuando el modo anotar está activo -->
+            <div id="capaCaptura" class="capa-captura"></div>
+
+            <!-- Modal de captura de texto (reemplaza prompt(), que bloquearía la cámara AR) -->
+            <div id="modalEntrada" class="modal-overlay">
+                <div class="modal-tarjeta">
+                    <h4>Nueva anotación</h4>
+                    <input id="inputNota" type="text" placeholder="Ej. Borde lateral del húmero" autocomplete="off">
+                    <div class="modal-acciones">
+                        <button id="btnCancelarNota" class="btn btn-secundario">Cancelar</button>
+                        <button id="btnGuardarNota" class="btn btn-primario">Guardar</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tarjeta de solo lectura al tocar un hotspot ya creado (reemplaza alert()) -->
+            <div id="modalInfo" class="modal-overlay">
+                <div class="modal-tarjeta">
+                    <h4 id="infoTitulo">Punto</h4>
+                    <p id="infoTexto"></p>
+                    <div class="modal-acciones">
+                        <button id="btnBorrarNota" class="btn btn-peligro" hidden>Borrar</button>
+                        <button id="btnCerrarInfo" class="btn btn-primario">Cerrar</button>
+                    </div>
+                </div>
+            </div>
+        </model-viewer>
+
+        <div id="registro-notas">
+            <h3>Anotaciones registradas (payload a guardar en BD):</h3>
+            <ul id="listaAnotaciones"></ul>
+            <details>
+                <summary>Ver JSON</summary>
+                <pre id="payloadJson">[]</pre>
+            </details>
+        </div>
+    </div>
+
+    <script>
+        const visor = document.getElementById('visor3d');
+        const btnAnotar = document.getElementById('btnAnotar');
+        const btnCamara = document.getElementById('btnCamara');
+        const btnReposicionar = document.getElementById('btnReposicionar');
+        const pillInstruccion = document.getElementById('pillInstruccion');
+        const capaCaptura = document.getElementById('capaCaptura');
+        const modalEntrada = document.getElementById('modalEntrada');
+        const inputNota = document.getElementById('inputNota');
+        const btnGuardarNota = document.getElementById('btnGuardarNota');
+        const btnCancelarNota = document.getElementById('btnCancelarNota');
+        const modalInfo = document.getElementById('modalInfo');
+        const infoTitulo = document.getElementById('infoTitulo');
+        const infoTexto = document.getElementById('infoTexto');
+        const btnCerrarInfo = document.getElementById('btnCerrarInfo');
+        const listaAnotaciones = document.getElementById('listaAnotaciones');
+        const videoCamara = document.getElementById('videoCamara');
+        const btnBorrarNota = document.getElementById('btnBorrarNota');
+        const payloadJson = document.getElementById('payloadJson');
+
+        // Identificador del modelo: las coordenadas de una anotación solo tienen
+        // sentido sobre ESE modelo. Si cambias la geometría, sube la versión.
+        const MODELO_ID = visor.dataset.modeloId;
+        const MODELO_VERSION = Number(visor.dataset.modeloVersion) || 1;
+        const CLAVE_ALMACEN = `bima-anotaciones:${MODELO_ID}:v${MODELO_VERSION}`;
+
+        let modoAnotacion = false;
+        let enSesionAR = false;
+        let modoCamara = false;
+        let streamCamara = null;
+        let contadorNotas = 0;
+        let hitPendiente = null; // { position, normal } del punto tocado, en espera del texto del modal
+        let anotaciones = [];    // registros tal como se guardan (ver crearAnotacion)
+        let idEnTarjeta = null;  // anotación abierta en la tarjeta de info
+        let confirmandoBorrado = false;
+
+        function textoInstruccion() {
+            if (enSesionAR || modoCamara) return 'Toca un punto del modelo para anotar';
+            return 'Haz clic sobre el modelo para marcar un punto';
+        }
+
+        // ---------- Toggle Explorar / Anotar (funciona igual en web, AR y modo cámara) ----------
+        function establecerModoAnotacion(activo) {
+            modoAnotacion = activo;
+            btnAnotar.classList.toggle('btn-activo', modoAnotacion);
+            capaCaptura.classList.toggle('activa', modoAnotacion);
+
+            if (modoAnotacion) {
+                btnAnotar.textContent = 'Modo: Anotar';
+                pillInstruccion.hidden = false;
+                pillInstruccion.textContent = textoInstruccion();
+                // Fuera de WebXR (web normal o modo cámara) desactivamos el
+                // orbit-control mientras se anota. En AR NO tocamos camera-controls:
+                // el bloqueo del gesto nativo lo hace la capa de captura.
+                if (!enSesionAR) visor.removeAttribute('camera-controls');
+                // Bloquea el pellizco (pinch-to-scale) solo mientras se anota, para
+                // que un pellizco accidental al marcar un punto no reescale el
+                // modelo. Fuera de Modo Anotar, el escalado queda libre de nuevo.
+                visor.setAttribute('ar-scale', 'fixed');
+            } else {
+                btnAnotar.textContent = 'Modo: Explorar';
+                pillInstruccion.hidden = true;
+                if (!enSesionAR) visor.setAttribute('camera-controls', '');
+                visor.setAttribute('ar-scale', 'auto');
+            }
+        }
+
+        btnAnotar.addEventListener('click', () => establecerModoAnotacion(!modoAnotacion));
+
+        // ---------- Detectar entrada/salida de sesión AR ----------
+        // ar-status pasa por 'session-started' y luego 'object-placed' (el modelo
+        // ya se colocó); ambos significan que seguimos dentro de AR.
+        visor.addEventListener('ar-status', (event) => {
+            const status = event.detail.status;
+            enSesionAR = status === 'session-started' || status === 'object-placed';
+            btnReposicionar.hidden = !enSesionAR;
+            if (modoAnotacion) pillInstruccion.textContent = textoInstruccion();
+            // Si veníamos anotando en web y entra a AR (o viceversa), reconciliamos
+            // el atributo camera-controls para no dejarlo apagado sin querer.
+            if (!enSesionAR && !modoAnotacion) visor.setAttribute('camera-controls', '');
+        });
+
+        // ---------- Modo cámara: solo donde NO hay WebXR AR (iPhone, escritorio) ----------
+        // En Android con Chrome hay WebXR, así que ahí se mantiene el AR real y
+        // este botón no aparece. En iPhone, Safari no tiene navigator.xr, así
+        // que el botón sí aparece. getUserMedia exige HTTPS (o localhost).
+        async function detectarSoporte() {
+            let webxrAR = false;
+            try {
+                webxrAR = !!(navigator.xr && await navigator.xr.isSessionSupported('immersive-ar'));
+            } catch (e) { /* sin WebXR */ }
+            const hayCamara = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+            btnCamara.hidden = webxrAR || !hayCamara;
+        }
+        detectarSoporte();
+
+        async function entrarModoCamara() {
+            try {
+                streamCamara = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: 'environment' } },
+                    audio: false
+                });
+            } catch (err) {
+                mostrarInfo('No se pudo abrir la cámara',
+                    'Revisa que le diste permiso de cámara a Safari y que la página se abre con https://. (' + err.name + ')');
+                return;
+            }
+            videoCamara.srcObject = streamCamara;
+            try { await videoCamara.play(); } catch (e) { /* autoplay+muted+playsinline debería bastar */ }
+            modoCamara = true;
+            document.body.classList.add('modo-camara');
+            window.scrollTo(0, 0);
+            btnCamara.textContent = 'Salir de cámara';
+            btnCamara.classList.add('btn-activo');
+            if (modoAnotacion) pillInstruccion.textContent = textoInstruccion();
+        }
+
+        function salirModoCamara() {
+            if (streamCamara) streamCamara.getTracks().forEach((t) => t.stop());
+            streamCamara = null;
+            videoCamara.srcObject = null;
+            modoCamara = false;
+            document.body.classList.remove('modo-camara');
+            btnCamara.textContent = 'Ver con cámara';
+            btnCamara.classList.remove('btn-activo');
+            if (modoAnotacion) pillInstruccion.textContent = textoInstruccion();
+        }
+
+        btnCamara.addEventListener('click', () => {
+            if (modoCamara) salirModoCamara(); else entrarModoCamara();
+        });
+
+        // ---------- Reposicionar: forzar una nueva colocación ----------
+        // model-viewer ya soporta mover el modelo con un dedo (arrastrar
+        // directamente sobre él) además de pinch-to-scale; si en tu dispositivo
+        // ese arrastre no responde (pasa en algunos Android según el modo AR
+        // que use el navegador), este botón sale de la sesión y la vuelve a
+        // abrir, mostrando de nuevo el retículo de piso para que toques un
+        // punto más cercano. Usa la API pública activateAR() para reabrir;
+        // para cerrar recurre al botón de salida que model-viewer expone
+        // como "part" con nombre estable (documentado para personalizar su
+        // estilo), así que es más seguro que tocar el shadow DOM a ciegas,
+        // aunque no es una API formalmente garantizada entre versiones.
+        btnReposicionar.addEventListener('click', () => {
+            if (modoAnotacion) establecerModoAnotacion(false);
+            const shadow = visor.shadowRoot;
+            const btnSalir = shadow && shadow.querySelector('[part~="default-exit-webxr-ar-button"]');
+            if (!btnSalir) return;
+            btnSalir.click();
+            setTimeout(() => visor.activateAR(), 400); // pequeño respiro a que cierre la sesión XR
+        });
+
+        // ---------- Captura del toque/clic para crear un hotspot ----------
+        // pointerdown cubre mouse (web) y touch (AR/móvil) con una sola ruta.
+        capaCaptura.addEventListener('pointerdown', (event) => {
+            if (!modoAnotacion) return;
+            // Clave para que WebXR no interprete este toque como "colocar/mover
+            // el modelo": lo detenemos aquí, dentro del DOM Overlay, antes de que
+            // se convierta en un evento "select" de la sesión XR.
+            event.preventDefault();
+            event.stopPropagation();
+            procesarToque(event.clientX, event.clientY);
+        }, { passive: false });
+
+        // Respaldo explícito con touchstart (algunos navegadores/Chrome en
+        // Android son más consistentes bloqueando el gesto nativo aquí que
+        // solo con pointerdown durante una sesión WebXR inmersiva).
+        capaCaptura.addEventListener('touchstart', (event) => {
+            if (!modoAnotacion) return;
+            event.preventDefault();
+        }, { passive: false });
+
+        function procesarToque(clientX, clientY) {
+            const hit = visor.positionAndNormalFromPoint(clientX, clientY);
+            if (!hit) return; // el toque cayó fuera de la geometría del modelo
+            hitPendiente = hit;
+            abrirModalEntrada();
+        }
+
+        // ---------- Modal de entrada (reemplaza prompt()) ----------
+        function abrirModalEntrada() {
+            inputNota.value = '';
+            modalEntrada.classList.add('visible');
+            // Enfocamos de forma SÍNCRONA, todavía dentro del gesto del usuario:
+            // Safari en iPhone solo abre el teclado si focus() ocurre durante el
+            // toque; si se llama desde un setTimeout, el input queda enfocado
+            // pero sin teclado. En AR (Android) abrir el teclado es válido y
+            // no rompe la sesión, a diferencia de alert()/prompt()/confirm().
+            inputNota.focus();
+        }
+
+        function cerrarModalEntrada() {
+            // Soltar el foco del input: cierra el teclado en iPhone y evita que el
+            // siguiente toque (p. ej. sobre un pin) se pierda solo en "desenfocar".
+            inputNota.blur();
+            modalEntrada.classList.remove('visible');
+            modalEntrada.style.paddingBottom = '16px';
+            hitPendiente = null;
+        }
+
+        // ---------- Mantener el input visible por encima del teclado ----------
+        // Cuando el teclado aparece, visualViewport se encoge (su altura baja
+        // respecto a window.innerHeight). Empujamos la tarjeta hacia arriba
+        // con ese mismo espacio, tanto en web como dentro del DOM Overlay de AR.
+        //
+        // A propósito NO escuchamos 'resize'/'scroll' de forma continua: dentro
+        // de una sesión WebXR activa, esos eventos se disparan con mucha más
+        // frecuencia de la esperada (parece un efecto del propio DOM Overlay
+        // recalculando junto con el feed de cámara), y recalcular en cada uno
+        // de ellos es lo que causaba el parpadeo al escribir — incluso con
+        // debounce. En vez de eso, medimos UNA sola vez, cuando el teclado ya
+        // terminó de aparecer tras enfocar el input, y no volvemos a tocarlo
+        // mientras el modal siga abierto.
+        function ajustarModalPorTeclado() {
+            if (!window.visualViewport || !modalEntrada.classList.contains('visible')) return;
+            const alturaTeclado = Math.max(0, window.innerHeight - window.visualViewport.height - window.visualViewport.offsetTop);
+            modalEntrada.style.paddingBottom = (alturaTeclado + 16) + 'px';
+        }
+        inputNota.addEventListener('focus', () => setTimeout(ajustarModalPorTeclado, 350));
+
+        btnCancelarNota.addEventListener('click', cerrarModalEntrada);
+
+        btnGuardarNota.addEventListener('click', () => {
+            const texto = inputNota.value.trim();
+            if (!texto || !hitPendiente) { cerrarModalEntrada(); return; }
+            crearAnotacion(hitPendiente, texto);
+            cerrarModalEntrada();
+            establecerModoAnotacion(false); // cada anotación queda "de una", sin encadenar puntos por accidente
+        });
+
+        inputNota.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') btnGuardarNota.click();
+            if (e.key === 'Escape') cerrarModalEntrada();
+        });
+
+        // =====================================================================
+        // PERSISTENCIA — hoy en el navegador (localStorage), por modelo.
+        // Para conectar tu base de datos, reemplaza SOLO estas dos funciones
+        // por llamadas a tu API (p. ej. GET/PUT /anotaciones?modelo=...).
+        // =====================================================================
+        function cargarAnotaciones() {
+            try {
+                const datos = JSON.parse(localStorage.getItem(CLAVE_ALMACEN) || '[]');
+                return Array.isArray(datos) ? datos.filter(esAnotacionValida) : [];
+            } catch (e) {
+                return []; // modo privado o datos corruptos: arrancamos vacío
+            }
+        }
+
+        function guardarAnotaciones() {
+            payloadJson.textContent = JSON.stringify(anotaciones, null, 2);
+            try {
+                localStorage.setItem(CLAVE_ALMACEN, JSON.stringify(anotaciones));
+            } catch (e) { /* sin almacenamiento disponible: quedan solo en memoria */ }
+        }
+
+        function esVector(v) {
+            return v && [v.x, v.y, v.z].every((n) => typeof n === 'number' && isFinite(n));
+        }
+        function esAnotacionValida(a) {
+            return a && typeof a.id === 'string' && typeof a.texto === 'string' &&
+                Number.isInteger(a.numero) && esVector(a.posicion) && esVector(a.normal);
+        }
+
+        function nuevoId() {
+            if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+            return Date.now().toString(36) + Math.random().toString(36).slice(2);
+        }
+
+        const redondear = (n) => Math.round(n * 10000) / 10000; // 0.1 mm basta
+        const aNumeros = (v) => ({ x: redondear(v.x), y: redondear(v.y), z: redondear(v.z) });
+        const aAtributo = (v) => `${v.x}m ${v.y}m ${v.z}m`; // formato que entiende model-viewer
+
+        // ---------- Crear una anotación nueva (formato que se guarda en BD) ----------
+        function crearAnotacion(hit, texto) {
+            const anotacion = {
+                id: nuevoId(),
+                numero: ++contadorNotas,
+                modeloId: MODELO_ID,
+                modeloVersion: MODELO_VERSION,
+                texto,
+                posicion: aNumeros(hit.position), // metros, coordenadas del modelo
+                normal: aNumeros(hit.normal),
+                creadaEn: new Date().toISOString()
+            };
+            anotaciones.push(anotacion);
+            dibujarAnotacion(anotacion);
+            guardarAnotaciones();
+        }
+
+        // ---------- Dibujar pin + entrada de la lista (nuevas y cargadas) ----------
+        function dibujarAnotacion(a) {
+            const pin = document.createElement('button');
+            pin.setAttribute('slot', `hotspot-${a.id}`);
+            pin.setAttribute('data-position', aAtributo(a.posicion));
+            pin.setAttribute('data-normal', aAtributo(a.normal));
+            pin.dataset.id = a.id;
+            pin.className = 'hotspot-pin';
+            pin.textContent = a.numero;
+            pin.addEventListener('click', (e) => {
+                e.stopPropagation();
+                mostrarInfo(`Punto #${a.numero}`, a.texto, a.id);
+            });
+            visor.appendChild(pin);
+
+            // Se arma con textContent (no innerHTML) para que el texto del
+            // usuario nunca se interprete como HTML.
+            const li = document.createElement('li');
+            li.dataset.id = a.id;
+            const titulo = document.createElement('strong');
+            titulo.textContent = `Punto #${a.numero}:`;
+            const btnBorrar = document.createElement('button');
+            btnBorrar.className = 'btn btn-mini btn-peligro';
+            btnBorrar.textContent = 'Borrar';
+            btnBorrar.addEventListener('click', () => borrarAnotacion(a.id));
+            const p = a.posicion;
+            const detalle = document.createElement('small');
+            detalle.textContent = `Posición (m): x ${p.x}, y ${p.y}, z ${p.z}`;
+            li.append(titulo, ` "${a.texto}" `, btnBorrar, document.createElement('br'), detalle);
+            listaAnotaciones.appendChild(li);
+        }
+
+        // ---------- Borrar ----------
+        function borrarAnotacion(id) {
+            anotaciones = anotaciones.filter((a) => a.id !== id);
+            visor.querySelector(`.hotspot-pin[data-id="${id}"]`)?.remove();
+            listaAnotaciones.querySelector(`li[data-id="${id}"]`)?.remove();
+            guardarAnotaciones();
+        }
+
+        // ---------- Tarjeta de info (reemplaza alert()) ----------
+        // Con id: es un pin y ofrece Borrar. Sin id: mensaje simple.
+        function mostrarInfo(titulo, texto, id = null) {
+            infoTitulo.textContent = titulo;
+            infoTexto.textContent = texto;
+            idEnTarjeta = id;
+            btnBorrarNota.hidden = !id;
+            reiniciarBorrado();
+            modalInfo.classList.add('visible');
+        }
+
+        function reiniciarBorrado() {
+            confirmandoBorrado = false;
+            btnBorrarNota.textContent = 'Borrar';
+        }
+
+        function cerrarInfo() {
+            modalInfo.classList.remove('visible');
+            idEnTarjeta = null;
+            reiniciarBorrado();
+        }
+
+        // Confirmación en dos toques: confirm() cerraría la sesión de AR.
+        btnBorrarNota.addEventListener('click', () => {
+            if (!idEnTarjeta) return;
+            if (!confirmandoBorrado) {
+                confirmandoBorrado = true;
+                btnBorrarNota.textContent = '¿Seguro? Toca otra vez';
+                return;
+            }
+            borrarAnotacion(idEnTarjeta);
+            cerrarInfo();
+        });
+        btnCerrarInfo.addEventListener('click', cerrarInfo);
+
+        // ---------- Al abrir la página: cargar lo guardado ----------
+        anotaciones = cargarAnotaciones();
+        contadorNotas = anotaciones.reduce((max, a) => Math.max(max, a.numero), 0);
+        anotaciones.forEach(dibujarAnotacion);
+        payloadJson.textContent = JSON.stringify(anotaciones, null, 2);
+    </script>
+</body>
+
+</html>
